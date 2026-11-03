@@ -25,9 +25,11 @@ plugins:
       enabled: true
       mode: active          # or observe: plan and report, never send
       stagger: true         # default true; each provider is staggered on its own
-      claude: {enabled: true, model: claude-haiku-5-5}   # defaults
-      codex: {enabled: false, model: gpt-6-luna}         # defaults: Codex is opt-in
-      accounts: []          # auth IDs or emails; empty = every account
+      claude: true          # default true
+      claude_model: claude-haiku-5-5
+      codex: false          # default false: Codex is opt-in
+      codex_model: gpt-6-luna
+      accounts: ""          # comma-separated auth IDs or emails (a YAML list works too); empty = every account
       check_interval: 5m
       tolerance: 15m        # how far from the ideal spacing a start may be
 ```

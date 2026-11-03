@@ -63,7 +63,7 @@ import (
 
 const (
 	pluginID      = "window-keeper"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.2.1"
 	abiVersion    = 1
 	schemaVersion = 9
 )

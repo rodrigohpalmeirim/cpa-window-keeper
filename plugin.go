@@ -26,9 +26,13 @@ type lifecycleRequest struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
+// configField describes one setting for the management panel. The host HTML-escapes
+// descriptions, so they avoid apostrophes and <>&.
 type configField struct {
 	Name        string
 	Type        string
+	Default     any      `json:",omitempty"`
+	EnumValues  []string `json:",omitempty"`
 	Description string
 }
 
@@ -82,25 +86,54 @@ type hostHTTPResponse struct {
 // ---- config ----
 
 type providerConfig struct {
-	Enabled *bool `yaml:"enabled" json:"enabled"`
+	Enabled *bool `json:"enabled"`
 	// Model is the one tiny request that starts a window.
-	Model string `yaml:"model" json:"model"`
+	Model string `json:"model"`
 }
 
+// config is flat (plain toggles and text fields) so the management panel renders it as a form.
 type config struct {
 	// Mode "active" starts windows; "observe" only plans and reports.
 	Mode    string `yaml:"mode"`
 	Stagger *bool  `yaml:"stagger"`
-	// Claude and Codex switch each provider on or off and pick the model of the starting request.
-	Claude providerConfig `yaml:"claude"`
-	Codex  providerConfig `yaml:"codex"`
+	// Claude and Codex switch each provider on or off; the models are for the starting request.
+	ClaudeOn    *bool  `yaml:"claude"`
+	ClaudeModel string `yaml:"claude_model"`
+	CodexOn     *bool  `yaml:"codex"`
+	CodexModel  string `yaml:"codex_model"`
 	// Accounts limits the keeper to these auth IDs or emails; empty means every account.
-	Accounts      []string `yaml:"accounts"`
-	CheckInterval string   `yaml:"check_interval"`
-	Tolerance     string   `yaml:"tolerance"`
+	Accounts      stringList `yaml:"accounts"`
+	CheckInterval string     `yaml:"check_interval"`
+	Tolerance     string     `yaml:"tolerance"`
 
-	checkEvery time.Duration
-	tolerance  time.Duration
+	Claude, Codex providerConfig `yaml:"-"`
+	checkEvery    time.Duration
+	tolerance     time.Duration
+}
+
+// stringList accepts a YAML list or one comma-separated string.
+type stringList []string
+
+func (l *stringList) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.SequenceNode {
+		var v []string
+		if err := n.Decode(&v); err != nil {
+			return err
+		}
+		*l = v
+		return nil
+	}
+	var v string
+	if err := n.Decode(&v); err != nil {
+		return err
+	}
+	*l = nil
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			*l = append(*l, part)
+		}
+	}
+	return nil
 }
 
 func (c config) provider(name string) providerConfig {
@@ -128,18 +161,14 @@ func parseConfig(raw []byte) (config, error) {
 		c.Stagger = &on
 	}
 	// Claude is on unless switched off; Codex is off unless switched on.
-	if c.Claude.Enabled == nil {
-		c.Claude.Enabled = &on
+	if c.ClaudeOn == nil {
+		c.ClaudeOn = &on
 	}
-	if c.Codex.Enabled == nil {
-		c.Codex.Enabled = &off
+	if c.CodexOn == nil {
+		c.CodexOn = &off
 	}
-	if c.Claude.Model == "" {
-		c.Claude.Model = "claude-haiku-5-5"
-	}
-	if c.Codex.Model == "" {
-		c.Codex.Model = "gpt-6-luna"
-	}
+	c.Claude = providerConfig{Enabled: c.ClaudeOn, Model: firstNonEmpty(strings.TrimSpace(c.ClaudeModel), "claude-haiku-5-5")}
+	c.Codex = providerConfig{Enabled: c.CodexOn, Model: firstNonEmpty(strings.TrimSpace(c.CodexModel), "gpt-6-luna")}
 	var err error
 	if c.checkEvery, err = durationOr(c.CheckInterval, 5*time.Minute); err != nil {
 		return c, err
@@ -224,7 +253,7 @@ func handleMethod(method string, req []byte) ([]byte, error) {
 	case "management.register":
 		return okEnvelope(map[string]any{"routes": []managementRoute{
 			{Method: "GET", Path: "/window-keeper/status",
-				Description: "Each account's 5-hour window, the planned (staggered) start of idle ones and the last start."},
+				Description: "The 5-hour window of each account, the planned start of idle ones and the last start."},
 			{Method: "POST", Path: "/window-keeper/start",
 				Description: "Send the window-starting request through one account now (?account=<auth id or email>)."},
 		}})
@@ -241,13 +270,21 @@ func registrationInfo() registration {
 			Name: pluginID, Version: pluginVersion, Author: "rodrigohpalmeirim",
 			GitHubRepository: "https://github.com/rodrigohpalmeirim/cpa-window-keeper",
 			ConfigFields: []configField{
-				{Name: "mode", Type: "string", Description: "active (start windows) or observe (plan and report only)."},
-				{Name: "stagger", Type: "boolean", Description: "Spread each provider's 5-hour windows evenly instead of starting every idle one at once (default true)."},
-				{Name: "claude", Type: "object", Description: "enabled (default true) and model (default claude-haiku-5-5) for Claude accounts."},
-				{Name: "codex", Type: "object", Description: "enabled (default false) and model (default gpt-6-luna) for Codex accounts."},
-				{Name: "accounts", Type: "array", Description: "Auth IDs or emails to manage; empty means every account."},
-				{Name: "check_interval", Type: "string", Description: "How often idle accounts' usage is re-read (default 5m)."},
-				{Name: "tolerance", Type: "string", Description: "How far from the ideal spacing a start may be (default 15m)."},
+				{Name: "mode", Type: "enum", EnumValues: []string{"active", "observe"}, Default: "active",
+					Description: "Active starts windows. Observe only plans them and shows the plan in the status."},
+				{Name: "stagger", Type: "boolean", Default: true,
+					Description: "Space the 5-hour windows of each provider evenly, so resets are spread out."},
+				{Name: "claude", Type: "boolean", Default: true, Description: "Keep the 5-hour windows of Claude accounts running."},
+				{Name: "claude_model", Type: "string", Default: "claude-haiku-5-5",
+					Description: "Model for the one-token request that starts a Claude window (default claude-haiku-5-5)."},
+				{Name: "codex", Type: "boolean", Default: false, Description: "Keep the 5-hour windows of Codex accounts running."},
+				{Name: "codex_model", Type: "string", Default: "gpt-6-luna",
+					Description: "Model for the request that starts a Codex window (default gpt-6-luna)."},
+				{Name: "accounts", Type: "string",
+					Description: "Comma-separated auth IDs or emails to manage. Leave empty for every account."},
+				{Name: "check_interval", Type: "string", Default: "5m", Description: "How often idle accounts are re-read (default 5m)."},
+				{Name: "tolerance", Type: "string", Default: "15m",
+					Description: "How far from the ideal spacing a start may land (default 15m)."},
 			},
 		},
 		Capabilities: capabilities{ManagementAPI: true},
