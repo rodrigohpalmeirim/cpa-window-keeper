@@ -10,7 +10,10 @@ package keeper
 
 import (
 	"encoding/json"
+	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -108,17 +111,100 @@ func clearance(t time.Time, phases []time.Time, length time.Duration) time.Durat
 	return min
 }
 
-// Usage is what the keeper needs from https://api.anthropic.com/api/oauth/usage.
+// Usage is what the keeper needs from an account's usage endpoint.
 type Usage struct {
-	// HasSession reports a 5-hour ("session") limit entry; idle accounts may omit it.
+	// HasSession reports a 5-hour limit entry; idle accounts may omit it.
 	HasSession bool
 	// SessionResets is when the running 5-hour window ends; zero when none is running.
 	SessionResets time.Time
-	// WeeklyPct is the all-models weekly utilization in percent.
+	// WeeklyPct is the utilization of the longer limit (weekly, or monthly on some Codex plans),
+	// in percent; 100 means starting a window would be refused.
 	WeeklyPct float64
 }
 
-// ParseUsage reads the 5-hour and weekly limits, in the current ("limits" list) or the older
+const sessionSeconds = 5 * 3600
+
+// ParseCodexUsage reads https://chatgpt.com/backend-api/wham/usage: the 5-hour window is the one
+// whose limit_window_seconds is 18000; the others (weekly, monthly) count as the longer limit.
+func ParseCodexUsage(body []byte, now time.Time) (Usage, error) {
+	type window struct {
+		UsedPercent       *float64 `json:"used_percent"`
+		LimitWindowSecs   int64    `json:"limit_window_seconds"`
+		ResetAfterSeconds int64    `json:"reset_after_seconds"`
+		ResetAt           int64    `json:"reset_at"`
+	}
+	var doc struct {
+		RateLimit *struct {
+			LimitReached bool    `json:"limit_reached"`
+			Primary      *window `json:"primary_window"`
+			Secondary    *window `json:"secondary_window"`
+		} `json:"rate_limit"`
+	}
+	var u Usage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return u, err
+	}
+	if doc.RateLimit == nil {
+		return u, nil
+	}
+	for _, w := range []*window{doc.RateLimit.Primary, doc.RateLimit.Secondary} {
+		if w == nil || w.UsedPercent == nil {
+			continue
+		}
+		if w.LimitWindowSecs == sessionSeconds {
+			u.HasSession = true
+			u.SessionResets = resetTime(w.ResetAt, w.ResetAfterSeconds, now)
+		} else if *w.UsedPercent > u.WeeklyPct {
+			u.WeeklyPct = *w.UsedPercent
+		}
+	}
+	if doc.RateLimit.LimitReached && !u.SessionResets.After(now) {
+		u.WeeklyPct = 100 // refused for a reason other than a running 5-hour window
+	}
+	return u, nil
+}
+
+// codexHeaderRe matches the unscoped x-codex-{primary,secondary}-* rate limit headers.
+var codexHeaderRe = regexp.MustCompile(`^x-codex-(primary|secondary)-(window-minutes|reset-at|reset-after-seconds)$`)
+
+// CodexSessionFromHeaders returns when the 5-hour window ends according to a Codex response's
+// rate limit headers, for plans whose usage endpoint doesn't list it.
+func CodexSessionFromHeaders(h http.Header, now time.Time) time.Time {
+	vals := map[string]map[string]float64{}
+	for name := range h {
+		m := codexHeaderRe.FindStringSubmatch(strings.ToLower(name))
+		if m == nil {
+			continue
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(h.Get(name)), 64)
+		if err != nil {
+			continue
+		}
+		if vals[m[1]] == nil {
+			vals[m[1]] = map[string]float64{}
+		}
+		vals[m[1]][m[2]] = f
+	}
+	for _, v := range vals {
+		if v["window-minutes"] == sessionSeconds/60 {
+			return resetTime(int64(v["reset-at"]), int64(v["reset-after-seconds"]), now)
+		}
+	}
+	return time.Time{}
+}
+
+func resetTime(at, after int64, now time.Time) time.Time {
+	if at > 0 {
+		return time.Unix(at, 0).UTC()
+	}
+	if after > 0 {
+		return now.Add(time.Duration(after) * time.Second)
+	}
+	return time.Time{}
+}
+
+// ParseUsage reads Claude's https://api.anthropic.com/api/oauth/usage: the 5-hour and weekly
+// limits, in the current ("limits" list) or the older
 // (named windows) response shape.
 func ParseUsage(body []byte) (Usage, error) {
 	var u Usage

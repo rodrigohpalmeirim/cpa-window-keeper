@@ -16,6 +16,9 @@ import (
 
 const windowLength = 5 * time.Hour
 
+// providers the keeper knows, in display order.
+var providers = []string{"claude", "codex"}
+
 // ---- wire types (CPA plugin RPC schema v9) ----
 
 type lifecycleRequest struct {
@@ -78,19 +81,33 @@ type hostHTTPResponse struct {
 
 // ---- config ----
 
+type providerConfig struct {
+	Enabled *bool `yaml:"enabled" json:"enabled"`
+	// Model is the one tiny request that starts a window.
+	Model string `yaml:"model" json:"model"`
+}
+
 type config struct {
 	// Mode "active" starts windows; "observe" only plans and reports.
 	Mode    string `yaml:"mode"`
 	Stagger *bool  `yaml:"stagger"`
-	// Model is the request that starts a window: one tiny prompt.
-	Model string `yaml:"model"`
-	// Accounts limits the keeper to these auth IDs or emails; empty means every Claude account.
+	// Claude and Codex switch each provider on or off and pick the model of the starting request.
+	Claude providerConfig `yaml:"claude"`
+	Codex  providerConfig `yaml:"codex"`
+	// Accounts limits the keeper to these auth IDs or emails; empty means every account.
 	Accounts      []string `yaml:"accounts"`
 	CheckInterval string   `yaml:"check_interval"`
 	Tolerance     string   `yaml:"tolerance"`
 
 	checkEvery time.Duration
 	tolerance  time.Duration
+}
+
+func (c config) provider(name string) providerConfig {
+	if name == "codex" {
+		return c.Codex
+	}
+	return c.Claude
 }
 
 func parseConfig(raw []byte) (config, error) {
@@ -106,12 +123,22 @@ func parseConfig(raw []byte) (config, error) {
 	if c.Mode != "active" && c.Mode != "observe" {
 		return c, fmt.Errorf("window-keeper: mode must be active or observe, got %q", c.Mode)
 	}
+	on, off := true, false
 	if c.Stagger == nil {
-		on := true
 		c.Stagger = &on
 	}
-	if c.Model == "" {
-		c.Model = "claude-haiku-5-5"
+	// Claude is on unless switched off; Codex is off unless switched on.
+	if c.Claude.Enabled == nil {
+		c.Claude.Enabled = &on
+	}
+	if c.Codex.Enabled == nil {
+		c.Codex.Enabled = &off
+	}
+	if c.Claude.Model == "" {
+		c.Claude.Model = "claude-haiku-5-5"
+	}
+	if c.Codex.Model == "" {
+		c.Codex.Model = "gpt-6-luna"
 	}
 	var err error
 	if c.checkEvery, err = durationOr(c.CheckInterval, 5*time.Minute); err != nil {
@@ -138,6 +165,7 @@ func durationOr(s string, def time.Duration) (time.Duration, error) {
 
 type account struct {
 	ID        string    `json:"id"`
+	Provider  string    `json:"provider"`
 	AuthIndex string    `json:"-"`
 	Label     string    `json:"label"`
 	Usage     *usageOut `json:"usage,omitempty"`
@@ -152,12 +180,24 @@ type account struct {
 	Note        string    `json:"note,omitempty"`
 
 	usage keeper.Usage
+	// headerResets is the 5-hour window end read from the starting request's response headers,
+	// for accounts whose usage endpoint doesn't list the window (some Codex plans).
+	headerResets time.Time
 }
 
 type usageOut struct {
 	Session   bool      `json:"has_5h_limit"`
 	ResetsAt  time.Time `json:"5h_resets_at,omitzero"`
-	WeeklyPct float64   `json:"weekly_pct"`
+	WeeklyPct float64   `json:"longer_limit_pct"`
+}
+
+// sessionResets is when the account's running 5-hour window ends, from the usage endpoint or,
+// failing that, from the last starting request's headers.
+func (a *account) sessionResets() time.Time {
+	if !a.usage.SessionResets.IsZero() {
+		return a.usage.SessionResets
+	}
+	return a.headerResets
 }
 
 var (
@@ -184,7 +224,7 @@ func handleMethod(method string, req []byte) ([]byte, error) {
 	case "management.register":
 		return okEnvelope(map[string]any{"routes": []managementRoute{
 			{Method: "GET", Path: "/window-keeper/status",
-				Description: "Each Claude account's 5-hour window, the planned (staggered) start of idle ones and the last start."},
+				Description: "Each account's 5-hour window, the planned (staggered) start of idle ones and the last start."},
 			{Method: "POST", Path: "/window-keeper/start",
 				Description: "Send the window-starting request through one account now (?account=<auth id or email>)."},
 		}})
@@ -202,9 +242,10 @@ func registrationInfo() registration {
 			GitHubRepository: "https://github.com/rodrigohpalmeirim/cpa-window-keeper",
 			ConfigFields: []configField{
 				{Name: "mode", Type: "string", Description: "active (start windows) or observe (plan and report only)."},
-				{Name: "stagger", Type: "boolean", Description: "Spread the accounts' 5-hour windows evenly instead of starting every idle one at once (default true)."},
-				{Name: "model", Type: "string", Description: "Model for the one-token request that starts a window (default claude-haiku-5-5)."},
-				{Name: "accounts", Type: "array", Description: "Auth IDs or emails to manage; empty means every Claude account."},
+				{Name: "stagger", Type: "boolean", Description: "Spread each provider's 5-hour windows evenly instead of starting every idle one at once (default true)."},
+				{Name: "claude", Type: "object", Description: "enabled (default true) and model (default claude-haiku-5-5) for Claude accounts."},
+				{Name: "codex", Type: "object", Description: "enabled (default false) and model (default gpt-6-luna) for Codex accounts."},
+				{Name: "accounts", Type: "array", Description: "Auth IDs or emails to manage; empty means every account."},
 				{Name: "check_interval", Type: "string", Description: "How often idle accounts' usage is re-read (default 5m)."},
 				{Name: "tolerance", Type: "string", Description: "How far from the ideal spacing a start may be (default 15m)."},
 			},
@@ -231,7 +272,8 @@ func configure(raw []byte) error {
 		go loop(stopCh)
 	}
 	mu.Unlock()
-	logf("info", "window-keeper %s configured: mode=%s stagger=%v model=%s", pluginVersion, c.Mode, *c.Stagger, c.Model)
+	logf("info", "window-keeper %s configured: mode=%s stagger=%v claude=%v codex=%v", pluginVersion, c.Mode,
+		*c.Stagger, *c.Claude.Enabled, *c.Codex.Enabled)
 	return nil
 }
 
@@ -264,9 +306,12 @@ func handleManagement(raw []byte) ([]byte, error) {
 	for _, a := range accounts {
 		list = append(list, a)
 	}
-	slices.SortFunc(list, func(a, b *account) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(list, func(a, b *account) int {
+		return strings.Compare(a.Provider+a.ID, b.Provider+b.ID)
+	})
 	body, err := json.MarshalIndent(map[string]any{
-		"now": time.Now().UTC(), "mode": cfg.Mode, "stagger": *cfg.Stagger, "model": cfg.Model, "accounts": list,
+		"now": time.Now().UTC(), "mode": cfg.Mode, "stagger": *cfg.Stagger,
+		"claude": cfg.Claude, "codex": cfg.Codex, "accounts": list,
 	}, "", " ")
 	mu.Unlock()
 	if err != nil {
@@ -276,6 +321,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 		Headers: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}}, Body: body})
 }
 
+// manualStart starts one account's window now, whether or not its provider is switched on.
 func manualStart(req managementRequest) ([]byte, error) {
 	want := ""
 	if v := req.Query["account"]; len(v) > 0 {
@@ -293,14 +339,7 @@ func manualStart(req managementRequest) ([]byte, error) {
 	if target == nil {
 		return jsonResponse(404, map[string]string{"error": "unknown account " + want})
 	}
-	err := startWindow(target.ID, c.Model)
-	mu.Lock()
-	target.StartedAt = time.Now()
-	target.StartErr = ""
-	if err != nil {
-		target.StartErr = err.Error()
-	}
-	mu.Unlock()
+	err := start(target, c.provider(target.Provider).Model)
 	if err != nil {
 		return jsonResponse(502, map[string]string{"error": err.Error()})
 	}
@@ -337,7 +376,7 @@ func tick() {
 	mu.Lock()
 	c := cfg
 	mu.Unlock()
-	files, err := listClaudeAccounts(c.Accounts)
+	files, err := listAccounts(c.Accounts)
 	if err != nil {
 		logf("warn", "window-keeper: auth list: %v", err)
 		return
@@ -353,7 +392,7 @@ func tick() {
 			a = &account{ID: f.ID}
 			accounts[f.ID] = a
 		}
-		a.AuthIndex, a.Label = f.AuthIndex, f.Label
+		a.Provider, a.AuthIndex, a.Label = f.provider(), f.AuthIndex, f.Label
 	}
 	for id := range accounts {
 		if !seen[id] {
@@ -369,7 +408,7 @@ func tick() {
 	mu.Unlock()
 
 	for _, a := range due {
-		u, err := fetchUsage(a.AuthIndex)
+		u, err := fetchUsage(a.Provider, a.AuthIndex)
 		mu.Lock()
 		a.FetchedAt = time.Now()
 		if err != nil {
@@ -379,45 +418,17 @@ func tick() {
 			continue
 		}
 		a.FetchErr = ""
-		checkStarted(a, u, a.FetchedAt)
 		a.usage = u
-		a.Usage = &usageOut{Session: u.HasSession, ResetsAt: u.SessionResets, WeeklyPct: u.WeeklyPct}
+		a.Usage = &usageOut{Session: u.HasSession, ResetsAt: a.sessionResets(), WeeklyPct: u.WeeklyPct}
+		checkStarted(a, a.FetchedAt)
 		mu.Unlock()
 	}
 
+	var start []*account
 	mu.Lock()
 	now = time.Now()
-	var in []keeper.Account
-	for _, a := range accounts {
-		if a.Usage == nil {
-			continue // never read: unknown, leave it alone
-		}
-		active := a.usage.SessionResets.After(now)
-		skip := a.usage.WeeklyPct >= 100 || now.Before(a.PausedUntil) || a.FetchErr != ""
-		in = append(in, keeper.Account{ID: a.ID, Label: a.Label, Active: active, ResetsAt: a.usage.SessionResets, Skip: skip})
-		if active || skip {
-			a.PlannedAt = time.Time{}
-		}
-		switch {
-		case a.usage.WeeklyPct >= 100:
-			a.Note = "weekly limit reached"
-		case active:
-			a.Note = ""
-		}
-	}
-	decisions := keeper.Plan(in, now, windowLength, *c.Stagger, c.tolerance)
-	var start []*account
-	for _, d := range decisions {
-		a := accounts[d.ID]
-		if d.StartNow {
-			a.PlannedAt = time.Time{}
-			start = append(start, a)
-			continue
-		}
-		if !a.PlannedAt.Equal(d.At) {
-			logf("info", "window-keeper: %s idle; staggered start planned at %s", a.Label, d.At.UTC().Format(time.RFC3339))
-		}
-		a.PlannedAt = d.At
+	for _, p := range providers {
+		start = append(start, planProvider(p, c, now)...)
 	}
 	mu.Unlock()
 
@@ -428,28 +439,76 @@ func tick() {
 			mu.Unlock()
 			continue
 		}
-		err := startWindow(a.ID, c.Model)
-		mu.Lock()
-		a.StartedAt = time.Now()
-		if err != nil {
-			a.StartErr = err.Error()
-			a.PausedUntil = a.StartedAt.Add(15 * time.Minute)
+		if err := start1(a, c); err != nil {
 			logf("warn", "window-keeper: starting %s's window failed: %v", a.Label, err)
 		} else {
-			a.StartErr = ""
 			logf("info", "window-keeper: started %s's 5-hour window", a.Label)
 		}
+	}
+}
+
+func start1(a *account, c config) error {
+	err := start(a, c.provider(a.Provider).Model)
+	if err != nil {
+		mu.Lock()
+		a.PausedUntil = time.Now().Add(15 * time.Minute)
 		mu.Unlock()
 	}
+	return err
+}
+
+// planProvider plans one provider's accounts (they are staggered among themselves) and returns
+// those to start now. The caller holds mu.
+func planProvider(provider string, c config, now time.Time) []*account {
+	enabled := *c.provider(provider).Enabled
+	var in []keeper.Account
+	for _, a := range accounts {
+		if a.Provider != provider || a.Usage == nil {
+			continue // never read: unknown, leave it alone
+		}
+		resets := a.sessionResets()
+		active := resets.After(now)
+		skip := a.usage.WeeklyPct >= 100 || now.Before(a.PausedUntil) || a.FetchErr != ""
+		in = append(in, keeper.Account{ID: a.ID, Label: a.Label, Active: active, ResetsAt: resets, Skip: skip})
+		if active || skip || !enabled {
+			a.PlannedAt = time.Time{}
+		}
+		switch {
+		case !enabled:
+			a.Note = provider + " is switched off"
+		case a.usage.WeeklyPct >= 100:
+			a.Note = "longer limit reached"
+		case active, a.Note == provider+" is switched off":
+			a.Note = ""
+		}
+	}
+	if !enabled {
+		return nil
+	}
+	var out []*account
+	for _, d := range keeper.Plan(in, now, windowLength, *c.Stagger, c.tolerance) {
+		a := accounts[d.ID]
+		if d.StartNow {
+			a.PlannedAt = time.Time{}
+			out = append(out, a)
+			continue
+		}
+		if !a.PlannedAt.Equal(d.At) {
+			logf("info", "window-keeper: %s idle; staggered start planned at %s", a.Label, d.At.UTC().Format(time.RFC3339))
+		}
+		a.PlannedAt = d.At
+	}
+	return out
 }
 
 // needsFetch: never read, periodic refresh, the running window just ended, a planned start is
 // due, or a start needs confirming.
 func needsFetch(a *account, now time.Time, every time.Duration) bool {
+	end := a.sessionResets()
 	switch {
 	case a.FetchedAt.IsZero(), now.Sub(a.FetchedAt) >= every:
 		return true
-	case !a.usage.SessionResets.IsZero() && now.After(a.usage.SessionResets.Add(20*time.Second)) && a.FetchedAt.Before(a.usage.SessionResets.Add(20*time.Second)):
+	case !end.IsZero() && now.After(end.Add(20*time.Second)) && a.FetchedAt.Before(end.Add(20*time.Second)):
 		return true
 	case !a.PlannedAt.IsZero() && !now.Before(a.PlannedAt):
 		return true
@@ -459,17 +518,14 @@ func needsFetch(a *account, now time.Time, every time.Duration) bool {
 	return false
 }
 
-// checkStarted looks at the first reading after a start: if no window is running, pause the
-// account (longer when it reports no 5-hour limit at all) instead of retrying every minute.
-func checkStarted(a *account, u keeper.Usage, now time.Time) {
-	if a.StartedAt.IsZero() || a.StartErr != "" || a.FetchedAt.Sub(a.StartedAt) > 10*time.Minute || u.SessionResets.After(now) {
+// checkStarted looks at the first readings after a start: if no window is running, pause the
+// account (a day when it reports no 5-hour limit at all) instead of retrying every minute.
+func checkStarted(a *account, now time.Time) {
+	if a.StartedAt.IsZero() || a.StartErr != "" || now.Sub(a.StartedAt) > 10*time.Minute || a.sessionResets().After(now) {
 		return
 	}
-	if a.FetchedAt.Before(a.StartedAt) {
-		return
-	}
-	if !u.HasSession {
-		a.PausedUntil, a.Note = now.Add(6*time.Hour), "no 5-hour limit reported"
+	if !a.usage.HasSession {
+		a.PausedUntil, a.Note = now.Add(24*time.Hour), "no 5-hour limit reported"
 	} else {
 		a.PausedUntil, a.Note = now.Add(time.Hour), "start request did not open a window"
 	}
@@ -488,7 +544,14 @@ type authFile struct {
 	Disabled  bool   `json:"disabled"`
 }
 
-func listClaudeAccounts(only []string) ([]authFile, error) {
+func (f authFile) provider() string {
+	if f.Provider != "" {
+		return strings.ToLower(f.Provider)
+	}
+	return strings.ToLower(f.Type)
+}
+
+func listAccounts(only []string) ([]authFile, error) {
 	var list struct {
 		Files []authFile `json:"files"`
 	}
@@ -497,11 +560,7 @@ func listClaudeAccounts(only []string) ([]authFile, error) {
 	}
 	var out []authFile
 	for _, f := range list.Files {
-		p := strings.ToLower(f.Provider)
-		if p == "" {
-			p = strings.ToLower(f.Type)
-		}
-		if p != "claude" || f.Disabled {
+		if !slices.Contains(providers, f.provider()) || f.Disabled {
 			continue
 		}
 		if f.ID == "" {
@@ -520,56 +579,91 @@ func listClaudeAccounts(only []string) ([]authFile, error) {
 	return out, nil
 }
 
-func fetchUsage(authIndex string) (keeper.Usage, error) {
+type credential struct {
+	AccessToken      string `json:"access_token"`
+	AccountID        string `json:"account_id"`
+	ChatGPTAccountID string `json:"chatgpt_account_id"`
+}
+
+func fetchUsage(provider, authIndex string) (keeper.Usage, error) {
 	var got struct {
 		JSON json.RawMessage `json:"json"`
 	}
 	if err := callHost("host.auth.get", map[string]any{"auth_index": authIndex}, &got); err != nil {
 		return keeper.Usage{}, err
 	}
-	var cred struct {
-		AccessToken string `json:"access_token"`
-	}
+	var cred credential
 	if err := json.Unmarshal(got.JSON, &cred); err != nil || cred.AccessToken == "" {
 		return keeper.Usage{}, fmt.Errorf("no access token in credential")
 	}
+	headers := http.Header{"Authorization": {"Bearer " + cred.AccessToken}, "Accept": {"application/json"}}
+	url := "https://api.anthropic.com/api/oauth/usage"
+	if provider == "codex" {
+		url = "https://chatgpt.com/backend-api/wham/usage"
+		headers["User-Agent"] = []string{"codex-tui/0.149.1"}
+		if id := firstNonEmpty(cred.ChatGPTAccountID, cred.AccountID); id != "" {
+			headers["Chatgpt-Account-Id"] = []string{id}
+		}
+	} else {
+		headers["Anthropic-Beta"] = []string{"oauth-2025-04-20"}
+		headers["User-Agent"] = []string{"claude-cli/2.1.280 (external, cli)"}
+	}
 	var resp hostHTTPResponse
-	err := callHost("host.http.do", hostHTTPRequest{Method: "GET", URL: "https://api.anthropic.com/api/oauth/usage",
-		Headers: http.Header{
-			"Authorization":  {"Bearer " + cred.AccessToken},
-			"Accept":         {"application/json"},
-			"Anthropic-Beta": {"oauth-2025-04-20"},
-			"User-Agent":     {"claude-cli/2.1.280 (external, cli)"},
-		}}, &resp)
-	if err != nil {
+	if err := callHost("host.http.do", hostHTTPRequest{Method: "GET", URL: url, Headers: headers}, &resp); err != nil {
 		return keeper.Usage{}, err
 	}
 	if resp.StatusCode != 200 {
 		return keeper.Usage{}, fmt.Errorf("HTTP %d: %.200s", resp.StatusCode, resp.Body)
 	}
+	if provider == "codex" {
+		return keeper.ParseCodexUsage(resp.Body, time.Now())
+	}
 	return keeper.ParseUsage(resp.Body)
 }
 
-// startWindow sends one tiny request through the account, via the host's normal Claude path
-// (pinned to that credential), which opens a new 5-hour window.
-func startWindow(authID, model string) error {
-	body, _ := json.Marshal(map[string]any{
-		"model": model, "max_tokens": 1,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
-	var resp struct {
-		StatusCode int `json:"status_code"`
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
 	}
-	err := callHost("host.model.execute", map[string]any{
-		"entry_protocol": "claude", "exit_protocol": "claude", "model": model, "stream": false,
-		"body": body, "headers": http.Header{"Content-Type": {"application/json"}},
-		"forced_provider": "claude", "auth_id": authID,
-	}, &resp)
+	return b
+}
+
+// start sends one tiny request through the account, via the host's normal path for its provider
+// (pinned to that credential), which opens a new 5-hour window, and records the outcome.
+func start(a *account, model string) error {
+	mu.Lock()
+	id, provider := a.ID, a.Provider
+	mu.Unlock()
+	req := map[string]any{"model": model, "stream": false, "auth_id": id, "forced_provider": provider,
+		"headers": http.Header{"Content-Type": {"application/json"}}}
+	var body []byte
+	if provider == "codex" {
+		req["entry_protocol"], req["exit_protocol"] = "openai-response", "openai-response"
+		body, _ = json.Marshal(map[string]any{"model": model, "input": "hi", "max_output_tokens": 16})
+	} else {
+		req["entry_protocol"], req["exit_protocol"] = "claude", "claude"
+		body, _ = json.Marshal(map[string]any{"model": model, "max_tokens": 1,
+			"messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	}
+	req["body"] = body
+	var resp struct {
+		StatusCode int         `json:"status_code"`
+		Headers    http.Header `json:"headers"`
+	}
+	err := callHost("host.model.execute", req, &resp)
+	if err == nil && resp.StatusCode != 200 {
+		err = fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	now := time.Now()
+	mu.Lock()
+	defer mu.Unlock()
+	a.StartedAt, a.StartErr = now, ""
 	if err != nil {
+		a.StartErr = err.Error()
 		return err
 	}
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	if provider == "codex" {
+		a.headerResets = keeper.CodexSessionFromHeaders(resp.Headers, now)
 	}
 	return nil
 }

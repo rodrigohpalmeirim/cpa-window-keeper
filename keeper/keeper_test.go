@@ -1,6 +1,7 @@
 package keeper
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -93,5 +94,45 @@ func TestParseUsage(t *testing.T) {
 	u, err = ParseUsage([]byte(`{"five_hour":null,"seven_day":{"utilization":3}}`))
 	if err != nil || u.HasSession {
 		t.Fatalf("no session = %+v, %v", u, err)
+	}
+}
+
+func TestParseCodexUsage(t *testing.T) {
+	// Plus-style: 5h primary running, weekly secondary.
+	u, err := ParseCodexUsage([]byte(`{"rate_limit":{"limit_reached":false,
+		"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1793718000},
+		"secondary_window":{"used_percent":40,"limit_window_seconds":604800,"reset_at":1794000000}}}`), now)
+	if err != nil || !u.HasSession || !u.SessionResets.Equal(time.Unix(1793718000, 0).UTC()) || u.WeeklyPct != 40 {
+		t.Fatalf("plus = %+v, %v", u, err)
+	}
+	// Free plan: one 30-day window, no 5-hour limit.
+	u, err = ParseCodexUsage([]byte(`{"plan_type":"free","rate_limit":{"limit_reached":false,
+		"primary_window":{"used_percent":1,"limit_window_seconds":2592000,"reset_at":1796251586},"secondary_window":null}}`), now)
+	if err != nil || u.HasSession || u.WeeklyPct != 1 {
+		t.Fatalf("free = %+v, %v", u, err)
+	}
+	// Refused without a running 5-hour window: treat as the longer limit being full.
+	u, _ = ParseCodexUsage([]byte(`{"rate_limit":{"limit_reached":true,
+		"primary_window":{"used_percent":100,"limit_window_seconds":2592000,"reset_at":1796251586}}}`), now)
+	if u.WeeklyPct != 100 {
+		t.Fatalf("limit reached = %+v", u)
+	}
+}
+
+func TestCodexSessionFromHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Codex-Primary-Used-Percent", "3")
+	h.Set("X-Codex-Primary-Window-Minutes", "300")
+	h.Set("X-Codex-Primary-Reset-After-Seconds", "17940")
+	h.Set("X-Codex-Secondary-Window-Minutes", "10080")
+	h.Set("X-Codex-Secondary-Reset-At", "1794000000")
+	if got := CodexSessionFromHeaders(h, now); !got.Equal(now.Add(17940 * time.Second)) {
+		t.Fatalf("session = %v", got)
+	}
+	h = http.Header{}
+	h.Set("X-Codex-Primary-Window-Minutes", "43200")
+	h.Set("X-Codex-Primary-Reset-At", "1796251586")
+	if got := CodexSessionFromHeaders(h, now); !got.IsZero() {
+		t.Fatalf("monthly only = %v", got)
 	}
 }
